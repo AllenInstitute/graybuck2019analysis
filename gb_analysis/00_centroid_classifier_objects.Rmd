@@ -1,0 +1,60 @@
+---
+title: "RNA-seq objects for Centroid Classifier analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+Here, I'll load and inspect the RNA-seq objects that are required for using the `scrattch.hicat` centroid classifier functions.
+
+```{r}
+# Zizhen's process directory
+pdir <- "//allen/programs/celltypes/workgroups/rnaseqanalysis/V1_ALM/process_24411/"
+```
+
+
+cl.clean.rda contains a named factor factor object, cl.clean, with cluster ids as values, and sample ids as names
+```{r}
+load(file.path(pdir,"cl.clean.rda"))
+str(cl.clean)
+```
+
+cl.df.rda contains a data.frame, cl.df, with cluster annotations.
+```{r}
+load(file.path(pdir,"cl.df.rda"))
+str(cl.df)
+```
+
+Importantly, the `rownames()` of cl.df match the values in the cl.clean factor object, and are used for selection of rows by Zizhen's scripts.
+```{r}
+rownames(cl.df)
+```
+
+norm.dat.rda contains norm.dat, a dgCMatrix of log2-transformed cpm values for every sample and gene. I think this could also be substituted with a full, base R matrix object, and the functions should still run.
+```{r}
+load(file.path(pdir,"norm.dat.rda"))
+dim(norm.dat)
+norm.dat[1:5,1:5]
+```
+
+cl.med.rda contains cl.med, a matrix of per-cluster median values. `colnames()` match the values of cl.clean.
+```{r}
+load(file.path(pdir,"cl.med.rda"))
+dim(cl.med)
+cl.med[1:5,1:5]
+```
+
+V1.cl.rda contains V1.cl, V1.cells, and V1.markers, which are used in this analysis to subset the combined ALM and VISp data for only VISp, and provide the set of marker genes used by the classifier.  
+
+For human MTG data, you'll likely only need an equivalent of V1.markers, and can use your cl object without something like V1.cl or V1.cells.  
+
+V1.cl is a factor object, analogous to cl.clean. V1.cells and V1.markers are simple character vectors.
+```{r}
+load(file.path(pdir,"V1.cl.rda"))
+str(V1.cl)
+
+str(V1.cells)
+
+str(V1.markers)
+```
+

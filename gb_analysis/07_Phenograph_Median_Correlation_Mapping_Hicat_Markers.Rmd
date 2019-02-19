@@ -1,0 +1,281 @@
+---
+title: "Phenograph Median Correlation Mapping"
+output:
+  html_document:
+    df_print: paged
+---
+
+In this notebook, I'll take results from 02_Jaccard_tSNE, perform phenograph clustering of samples to get neighborhoods of related cells, and group those cells to generate TSS-centric counts for mapping to transcriptomic types using a simple median correlation.
+
+First, load necessary libraries:
+```{r Load libraries}
+library(dplyr)
+library(matrixStats)
+library(lowcat)
+library(ggplot2)
+library(GenomicRanges)
+library(Rphenograph)
+library(purrr)
+options(stringsAsFactors = F)
+```
+
+Median matrices were already computed for subclasses and clusters in 01_Ingest_and_QC. We'll also need to select genes to use for this analysis based on comonality between gene expression data and TSS regions, and a sd cutoff for variance:
+```{r Load medians}
+#sd_cutoff <- 2
+#load(file.path(pdir,"V1.cl.rda"))
+load("../common/selected_visp_markers.rda")
+
+load("../common/tss_regions_2e4.rda")
+load("../common/median_matrixes.rda")
+
+subclass_med_mat <- subclass_med_mat[selected_markers,]
+cluster_med_mat <- cluster_med_mat[selected_markers,]
+
+# subclass_med_mat <- matrix_var_filter(subclass_med_mat, sd_cut = sd_cutoff)
+# cluster_med_mat <- matrix_var_filter(cluster_med_mat, sd_cut = sd_cutoff)
+
+subclass_tss_regions <- tss_regions %>%
+  filter(name %in% rownames(subclass_med_mat))
+
+subclass_tss_regions_GR <- bed_to_GRanges(subclass_tss_regions)
+
+cluster_tss_regions <- tss_regions %>%
+  filter(name %in% rownames(cluster_med_mat))
+
+cluster_tss_regions_GR <- bed_to_GRanges(cluster_tss_regions)
+
+```
+
+We also need to read annotations from the same .tome that was used to build the median matrices:
+```{r Load annotations}
+library(scrattch.io)
+# Load annotations
+anno <- read_tome_anno("//allen/programs/celltypes/workgroups/rnaseqanalysis/shiny/tomes/facs/mouse_V1_ALM_20180520/transcrip.tome")
+# Remove outlier clusters
+anno <- anno %>%
+  filter(cluster_id %in% 1:133) %>%
+  # Remove ALM-only clusters
+  group_by(cluster_id) %>%
+  mutate(alm_frac = sum(region_label == "ALM")/n()) %>%
+  ungroup() %>%
+  filter(alm_frac < 0.9) %>%
+  filter(region_label == "VISp")
+
+subclass_anno <- anno %>%
+  select(subclass_id, subclass_label, subclass_color) %>%
+  unique()
+names(subclass_anno) <- paste0("pred_",names(subclass_anno))
+
+cluster_anno <- anno %>%
+  select(cluster_id, cluster_label, cluster_color) %>%
+  unique()
+names(cluster_anno) <- paste0("pred_",names(cluster_anno))
+
+```
+
+We'll also need the tSNE coordinates and fragments from the BAM files:
+```{r Load scATAC}
+# Load Jaccard and tSNE results
+load("f1e4_e25_c10_ds1e4_x1e3_jaccard.rda")
+
+# load bam fragments
+load("f1e4_e25_c10_bam_fragments.rda")
+
+```
+
+Perform Rphenograph clustering on tSNE coordinate space:
+```{r}
+tsne_mat <- as.matrix(tsne_df[,c("x","y")])
+
+pg <- Rphenograph(tsne_mat, k = 6)
+pg_clust <- as.numeric(membership(pg[[2]]))
+
+pg_table <- as.data.frame(table(membership(pg[[2]])))
+pg_table
+
+#hist(pg_table, breaks = 20)
+```
+
+Plot Rphenograph clustering: 
+```{r}
+tsne_df$pg_clust <- pg_clust
+tsne_df$pg_clust_color <- varibow(max(pg_clust))[pg_clust]
+
+ggplot() + geom_point(data = tsne_df,
+                      aes(x = x, y = y,
+                          color = pg_clust_color)) +
+  scale_color_identity()
+
+```
+
+Let's balance the contributions of each cell within each cluster by sampling an equal number of reads based on the member with the lowest number of reads:
+```{r}
+pg_clusters <- unique(tsne_df$pg_clust)
+
+balanced_fragments <- balance_fragment_clusters(bam_fragments,
+                                                 pg_clusters)
+
+```
+
+
+Now, we'll compute counts for each sample vs each of these region sets:
+```{r}
+subclass_tss_counts <- region_fragment_count_clusters(fragment_list = balanced_fragments,
+                                                      fragment_clusters = tsne_df$pg_clust,
+                                                      subclass_tss_regions_GR)
+
+cluster_tss_counts <- region_fragment_count_clusters(fragment_list = balanced_fragments,
+                                                     fragment_clusters = tsne_df$pg_clust,
+                                                     cluster_tss_regions_GR)
+```
+
+With counts, we can run correlations with the columns in the subclass and cluster matrices:
+```{r}
+# This is a key step!
+common_subclass_med <- subclass_med_mat[rownames(subclass_tss_counts),]
+# Above is a key step!
+subclass_max_cor <- max_column_correlation(subclass_tss_counts,
+                                           log2(common_subclass_med + 1))
+names(subclass_max_cor) <- c("pg_clust","pred_subclass_cor","pred_subclass_label")
+subclass_max_cor$pg_clust <- as.numeric(subclass_max_cor$pg_clust)
+
+common_cluster_med <- cluster_med_mat[rownames(cluster_tss_counts),]
+cluster_max_cor <- max_column_correlation(cluster_tss_counts,
+                                          log2(common_cluster_med + 1))
+names(cluster_max_cor) <- c("pg_clust","pred_cluster_cor","pred_cluster_label")
+cluster_max_cor$pg_clust <- as.numeric(cluster_max_cor$pg_clust)
+
+
+```
+
+Let's join things together and try plotting:
+```{r}
+
+subclass_tsne_data <- tsne_df %>%
+  left_join(subclass_max_cor) %>%
+  left_join(subclass_anno)
+
+cluster_tsne_data <- tsne_df %>%
+  left_join(cluster_max_cor) %>%
+  left_join(cluster_anno)
+
+ggplot() +
+  geom_point(data = subclass_tsne_data,
+             aes(x = x, y = y,
+                 color = pred_subclass_color)) +
+  scale_color_identity()
+
+ggplot() +
+  geom_point(data = cluster_tsne_data,
+             aes(x = x, y = y,
+                 color = pred_cluster_color)) +
+  scale_color_identity()
+
+```
+
+Save the outputs for use later:
+```{r}
+results <- tsne_df %>%
+  left_join(subclass_max_cor) %>%
+  left_join(subclass_anno) %>%
+  left_join(cluster_max_cor) %>%
+  left_join(cluster_anno)
+
+write.csv(results, "2e4_tss_phenograph_scatac_visp_marker_correlation.csv")
+
+save(subclass_tss_counts,
+     cluster_tss_counts,
+     file = "2e4_tss_phenograph_scatac_visp_marker_correlation_matrices.rda")
+```
+
+
+```{r Merge BAMS}
+library(purrr)
+
+bam_dir <- "07_PMC_markers_bam"
+
+dir.create(bam_dir)
+
+pred_clusters <- unique(results$pred_cluster_label)
+
+walk(pred_clusters,
+     function(x) {
+       cluster_samples <- results$sample_id[results$pred_cluster_label == x]
+       bam_files <- samples$bam_file[match(cluster_samples, samples$sample_id)]
+       x <- gsub("/","_",x)
+       bam_out <- paste0(bam_dir,"/",
+                         gsub(" ","_",x),
+                         ".bam")
+       if(!file.exists(bam_out)) {
+         merge_bam_files(bam_files,
+                         bam_out)
+       } else {
+         print(paste0(bam_out," already exists. Skipping."))
+       }
+
+     })
+
+```
+
+Per-subclass BAMs
+```{r Merge BAMS}
+library(purrr)
+
+bam_dir <- "07_PMC_markers_subclass_bam"
+
+dir.create(bam_dir)
+
+pred_subclasss <- unique(results$pred_subclass_label)
+
+walk(pred_subclasss,
+     function(x) {
+       subclass_samples <- results$sample_id[results$pred_subclass_label == x]
+       bam_files <- samples$bam_file[match(subclass_samples, samples$sample_id)]
+       x <- gsub("/","_",x)
+       bam_out <- paste0(bam_dir,"/",
+                         gsub(" ","_",x),
+                         ".bam")
+       if(!file.exists(bam_out)) {
+         merge_bam_files(bam_files,
+                         bam_out)
+       } else {
+         print(paste0(bam_out," already exists. Skipping."))
+       }
+
+     })
+
+```
+
+Per-plot group BAMs
+```{r Merge group BAMs}
+library(purrr)
+
+bam_dir <- "07_PMC_markers_group_bam"
+
+dir.create(bam_dir)
+
+group_anno <- read.csv(file.path(data_dir,"cluster_grouping_for_tracks.csv"))
+
+results <- results %>%
+  left_join(group_anno)
+
+pred_groups <- unique(results$group_label)
+
+walk(pred_groups,
+     function(x) {
+       group_samples <- results$sample_id[results$group_label == x]
+       bam_files <- samples$bam_file[match(group_samples, samples$sample_id)]
+       x <- gsub("/","_",x)
+       bam_out <- paste0(bam_dir,"/",
+                         gsub(" ","_",x),
+                         ".bam")
+       if(!file.exists(bam_out)) {
+         merge_bam_files(bam_files,
+                         bam_out)
+       } else {
+         print(paste0(bam_out," already exists. Skipping."))
+       }
+
+     })
+
+```

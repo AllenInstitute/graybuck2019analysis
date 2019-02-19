@@ -1,0 +1,146 @@
+---
+title: "AWS scATAC-seq Jaccard Clustering"
+output: html_notebook
+---
+
+This notebook is intended to be launched using my launch template called "bioconductor-3.6-20180627". 
+
+Data are stored in snapshot snap-0d06d83c5af8f8eab
+
+m5.12xlarge = 48-core x 192 GB
+m5.24xlarge = 96-core x 384 GB
+
+subnet: us-east-1a
+
+This uses the public AMI from BioConductor with AMI ID ami-ac5df1d3
+The image requires at least 4 cores and 16GB (t2.xlarge)
+Need to add Port 80 at the Security Group step to use Rstudio server.
+
+This needs to be run in the console of the AWS image to get the EBS volume set up and mounted. The sudo password for the pre-built user ubuntu is "bioc"
+
+To ssh, use 
+ssh -i Dropbox/AWS/aibs-scatac-key.pem ubuntu@ --DNS--
+```
+sudo mkdir /scatac_data
+sudo mount /dev/xvdf /scatac_data
+
+sudo mount /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol05aa57a4865858c4c /scatac_data
+```
+
+Load packages for analysis:
+```{r Load Libraries}
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(GenomicAlignments))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(lowcat))
+suppressPackageStartupMessages(library(Matrix))
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(Rphenograph))
+suppressPackageStartupMessages(library(Rtsne.multicore))
+
+options(stringsAsFactors = FALSE)
+```
+
+For this analysis, I'll use the following parameters:
+```{r Set Parameters}
+# Random seed
+random_seed <- 42
+
+# Parallel settings
+n_cores <- 6
+cluster_type <- "PSOCK"
+
+# Sample QC Filtering
+fragment_filter <- 1e4
+encode_filter <- 0.25
+gt_250bp_filter <- 0.1
+
+# Downsampling and overlap settings
+downsample_n <- 1e4
+fragment_extension <- 1e3
+fragment_reduce <- TRUE
+
+# File locations
+data_dir <- "../common/"
+samples_csv <- file.path(data_dir,"all_samples.csv")
+fragment_rda <- file.path(data_dir,"bam_fragments.rda")
+medians_rda <- file.path(data_dir,"median_matrixes.rda")
+tss_rda <- file.path(data_dir, "tss_regions.rda")
+
+# Output settings
+jaccard_prefix <- "f1e4_e25_c10_ds1e4_x1e3"
+```
+
+Read files for analysis:
+```{r Read Files}
+samples <- read.csv(samples_csv)
+load(fragment_rda)
+```
+
+Filter samples based on QC Criteria parameters
+```{r Filter Samples}
+samples <- samples %>%
+  filter(unique_fragments > fragment_filter) %>%
+  filter(ENCODE_frac > encode_filter) %>%
+  filter(frac_gt_250bp > gt_250bp_filter)
+
+bam_fragments <- bam_fragments[samples$sample_id]
+```
+
+Downsample and resize fragments
+```{r Downsample and Resize}
+bam_downsampled <- downsample_fragments(bam_fragments,
+                                        downsample_n = downsample_n,
+                                        discard_if_too_few = TRUE)
+
+bam_expanded <- expand_fragments(bam_downsampled,
+                                 width = fragment_extension,
+                                 collapse = fragment_reduce)
+```
+
+Perform Jaccard distance calculations
+```{r Jaccard Distances}
+jaccard_results <- run_fragment_overlap_jaccard_parallel(bam_expanded,
+                                                         n_cores = n_cores,
+                                                         cluster_type = cluster_type)
+```
+
+Convert to a distance matrix and perform tSNE
+```{r tSNE}
+jaccard_matrix <- res_to_distance_matrix(jaccard_results)
+
+
+```
+
+```{r}
+pca <- prcomp(jaccard_matrix)
+
+keep_pc_mat <- pca$rotation[,2:20]
+```
+
+
+```{r}
+set.seed(random_seed)
+
+# tsne_results <- Rtsne.multicore(jaccard_matrix,
+tsne_results <- Rtsne.multicore(keep_pc_mat,
+                                is_distance = FALSE,
+                                pca = FALSE,
+                                perplexity = 10,
+                                num_threads = n_cores)
+rownames(tsne_results$Y) <- rownames(jaccard_matrix)
+
+tsne_df <- data.frame(sample_id = rownames(tsne_results$Y),
+                      x2 = tsne_results$Y[,1],
+                      y2 = tsne_results$Y[,2])
+
+samples <- left_join(samples, tsne_df)
+```
+
+Save the output
+```{r}
+out_file <- file.path(data_dir,paste0(jaccard_prefix,"_jaccard_pca.rda"))
+save(jaccard_results, jaccard_matrix, tsne_df, samples, file = out_file)
+```

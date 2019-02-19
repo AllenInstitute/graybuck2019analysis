@@ -1,0 +1,442 @@
+---
+title: "scATAC-seq QC and File Setup"
+output: html_notebook
+---
+
+This notebook is intended to be the first in the analysis chain - for reading in sample manifests, selecting samples, QC filtering, and outputting files for downstream clustering and analysis.
+
+```{r 1 Load Packages}
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(ggbeeswarm))
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(GenomicAlignments))
+suppressPackageStartupMessages(library(Rtsne.multicore))
+suppressPackageStartupMessages(library(dbscan))
+suppressPackageStartupMessages(library(Rphenograph))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(feather))
+suppressPackageStartupMessages(library(Matrix))
+library(scrattch.hicat)
+library(scrattch.io)
+library(lowcat)
+
+options(stringsAsFactors = FALSE)
+
+data_dir <- "//allen/programs/celltypes/workgroups/mct-t200/T502/scatac_analysis/data/"
+output_dir <- "//allen/programs/celltypes/workgroups/mct-t200/T502/scatac_analysis/doc/paper/common/"
+```
+
+```{r 2 Read File Manifests}
+
+
+# Find all manifests
+run_dirs <- list.files(data_dir, full.names = TRUE)
+
+manifest_files <- file.path(run_dirs,"sample_manifest.csv")
+manifest_files <- manifest_files[file.exists(manifest_files)]
+
+# Combine all manifests to build the samples table
+sample_manifests <- map(manifest_files, read.csv)
+
+samples <- do.call(rbind, sample_manifests)
+
+if(nrow(samples) == sum(file.exists(samples$bam_file))) {
+  print("All BAM files found.")
+} else {
+  
+  missing <- samples %>%
+    filter(!file.exists(samples$bam_file))
+  n_missing <- nrow(missing)
+  print(paste0("Missing ",n_missing," BAM files from sample manifests."))
+}
+
+print(nrow(samples))
+
+# # Filter out Human cells and cells from Cas9 perturbation experiments, which we won't use for this analysis
+samples <- samples %>%
+  filter(!full_genotype == "Gm12878") %>%
+  filter(!grepl("Cas9", full_genotype)) %>%
+# Also excluding 10/12/2016 run, as it's a duplicate of 11/02/2016
+  filter(!grepl("^20161012",sample_id)) %>%
+  filter(unique_fragments > 0) %>%
+  # Also excluding dox on/off experiments for now
+ filter(!grepl("Ai17",full_genotype))
+
+print(nrow(samples))
+
+#Pre-filtering counts
+source_counts <- table(samples$full_genotype)
+data.frame(source_label = names(source_counts),
+           n_cells = as.data.frame(source_counts)$Freq)
+
+```
+
+
+Next, we'll read the BAM files and build a list of GenomicRanges objects containing all BAM files.
+```{r 3 Read BAM Files}
+if(file.exists(file.path(output_dir, "bam_fragments.rda"))) {
+  load(file.path(output_dir, "bam_fragments.rda"))
+  n_not_loaded <- length(setdiff(samples$sample_id, names(bam_fragments)))
+  if(n_not_loaded > 0) {
+    print(paste0("Loading ",n_not_loaded," additional BAM files."))
+    missing_samples <- setdiff(samples$sample_id, names(bam_fragments))
+    new_bam_fragments <- run_pe_to_frag_parallel(bam_files = samples$bam_file[match(missing_samples, samples$sample_id)],
+                                                 sample_names = missing_samples,
+                                                 n_cores = 6)
+    new_bam_fragments <- map(new_bam_fragments, function(x) x[width(x) < 2e3])
+    bam_fragments <- c(bam_fragments, new_bam_fragments)
+    bam_fragments <- bam_fragments[samples$sample_id]
+    save(bam_fragments, file = "../common/bam_fragments.rda")
+  }
+  
+  bam_fragments <- bam_fragments[samples$sample_id]
+
+} else {
+  # Read the bam files as a list of GenomicRanges fragments
+  bam_fragments <- run_pe_to_frag_parallel(bam_files = samples$bam_file,
+                                           sample_names = samples$sample_id,
+                                           n_cores = 6)
+  save(bam_fragments, file = file.path(output_dir, "bam_fragments.rda"))
+}
+
+```
+
+Then, we can identify poor-quality samples by comaprison to ENCODE DNAse-seq peaks.
+
+For this purpose, we'll use ENCODE's experiment [ENCSR000COF](https://www.encodeproject.org/experiments/ENCSR000COF/), which is DNAse-seq on 8-week old mouse whole brain.
+
+Specifically, I'll use the file ENCFF651EAU, which is the current version of HotSpot Broad Peaks aligned to mm10.
+```{r 4 ENCODE comparison}
+if(!file.exists(file.path(output_dir, "ENCFF651EAU.bed.gz"))) {
+  download.file("https://www.encodeproject.org/files/ENCFF651EAU/@@download/ENCFF651EAU.bed.gz",
+                file.path(output_dir, "ENCFF651EAU.bed.gz"))
+}
+
+ENCFF651EAU <- read.delim(file.path(output_dir, "ENCFF651EAU.bed.gz"), header = F, sep = "\t")
+ENCFF651EAU_gr <- GRanges(seqnames = ENCFF651EAU[,1],
+                          IRanges(start = ENCFF651EAU[,2],
+                                  end = ENCFF651EAU[,3]))
+
+
+ENCFF651EAU_counts_mat <- count_fragment_overlaps(bam_fragments,
+                                                  ENCFF651EAU_gr,
+                                                  aggregate = F)
+
+samples <- samples %>% 
+  mutate(ENCODE_counts = colSums(ENCFF651EAU_counts_mat),
+         ENCODE_frac   = ENCODE_counts/unique_fragments)
+
+hist(samples$ENCODE_frac, breaks = 50)
+
+
+```
+
+```{r 5 Unique Fragment Histogram}
+hist(log10(samples$unique_fragments + 1), breaks = 50)
+```
+
+Compute the fraction of reads > 250bp, which is indicative of chromatin quality.
+```{r 6 Read length}
+samples <- samples %>%
+  mutate(frac_gt_250bp = map_dbl(sample_id,
+                             function(x) {
+                               sum(width(bam_fragments[[x]]) > 250)/length(bam_fragments[[x]])
+                             }))
+
+hist(samples$frac_gt_250bp, breaks = 50)
+```
+
+Plots comparing these 3 QC criteria
+```{r}
+ggplot() +
+  geom_point(data = samples,
+             aes(x = ENCODE_frac,
+                 y = frac_gt_250bp,
+                 color = log10(unique_fragments))) +
+  scale_color_gradient2(low = "darkblue",mid = "white",high = "red",midpoint = 4)
+```
+
+Let's check out batch stats to see how we're doing with generating new samples
+```{r 6 Batch Stats}
+samples <- samples %>%
+  mutate(miseq_batch = sub("_.+","",sample_id))
+
+batch_stats <- samples %>%
+  group_by(miseq_batch) %>%
+  summarise(median_unique_fragments = median(unique_fragments),
+            q25_unique_fragments = quantile(unique_fragments, 0.25),
+            q75_unique_fragments = quantile(unique_fragments, 0.75),
+            n_samples = n(),
+            n_gt5k_unique_fragments = sum(unique_fragments > 1e4),
+            frac_gt5k_unique_fragments = n_gt5k_unique_fragments/n_samples,
+            median_encode_overlap = median(ENCODE_frac),
+            q25_encode_overlap = quantile(ENCODE_frac, 0.25),
+            q75_encode_overlap = quantile(ENCODE_frac, 0.75),
+            n_gt0.25_encode_overlap = sum(ENCODE_frac > 0.25),
+            frac_gt0.25_encode_overlap = n_gt0.25_encode_overlap/n_samples,
+            n_pass_both = sum(unique_fragments > 1e4 & ENCODE_frac > 0.25),
+            frac_pass_both = n_pass_both/n())
+
+batch_stats
+# A briefer summary
+batch_stats %>% select(miseq_batch, n_samples, n_pass_both, frac_pass_both)
+
+ggplot() +
+  geom_quasirandom(data = samples,
+                   aes(x = miseq_batch,
+                       y = log10(unique_fragments),
+                       color = ENCODE_frac > 0.25)) +
+  geom_hline(aes(yintercept = log10(1e4))) +
+  scale_y_continuous("log10(Unique Fragments)") +
+  ggtitle("Unique Fragments per batch") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90,
+                                   hjust = 1, 
+                                   vjust = 0.5))
+
+ggplot() +
+  geom_quasirandom(data = samples,
+                   aes(x = miseq_batch,
+                       y = ENCODE_frac,
+                   color = unique_fragments > 1e4)) +
+  geom_hline(aes(yintercept = 0.25))+
+  ggtitle("Unique Fragments per batch")+
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90,
+                                   hjust = 1, 
+                                   vjust = 0.5))
+
+```
+It looks like batch 20171005 is undersequenced. Good ENCODE fraction, but too few reads for many samples.
+Lots of dead cells in 20171026.
+
+It's also good to look by donor to see if specific donors or genotypes are giving us trouble:
+```{r 7 Donor Stats}
+donor_stats <- samples %>%
+  group_by(animal, full_genotype) %>%
+  summarise(median_unique_fragments = median(unique_fragments),
+            q25_unique_fragments = quantile(unique_fragments, 0.25),
+            q75_unique_fragments = quantile(unique_fragments, 0.75),
+            n_samples = n(),
+            n_gt5k_unique_fragments = sum(unique_fragments >1e4),
+            frac_gt5k_unique_fragments = n_gt5k_unique_fragments/n_samples,
+            median_encode_overlap = median(ENCODE_frac),
+            q25_encode_overlap = quantile(ENCODE_frac, 0.25),
+            q75_encode_overlap = quantile(ENCODE_frac, 0.75),
+            n_gt0.25_encode_overlap = sum(ENCODE_frac > 0.25),
+            frac_gt0.25_encode_overlap = n_gt0.25_encode_overlap/n_samples,
+            n_pass_both = sum(unique_fragments > 1e4 & ENCODE_frac > 0.25),
+            frac_pass_both = n_pass_both/n())
+
+donor_stats
+
+# A briefer summary
+donor_stats %>% select(animal, full_genotype, n_samples, n_gt5k_unique_fragments, n_gt0.25_encode_overlap, n_pass_both, frac_pass_both)
+
+ggplot() +
+  geom_quasirandom(data = samples,
+                   aes(x = paste0(animal,"_",
+                                  sub("/.+","",full_genotype)),
+                       y = log10(unique_fragments),
+                       color = ENCODE_frac > 0.25)) +
+  geom_hline(aes(yintercept = log10(1e4))) +
+  scale_y_continuous("log10(Unique Fragments)") +
+  scale_x_discrete("Donor") +
+  ggtitle("Unique Fragments per donor") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90,
+                                   hjust = 1, 
+                                   vjust = 0.5))
+
+ggplot() +
+  geom_quasirandom(data = samples,
+                   aes(x = paste0(animal,"_",
+                                  sub("/.+","",full_genotype)),
+                       y = ENCODE_frac,
+                       color = unique_fragments > 1e4)) +
+  geom_hline(aes(yintercept = 0.25)) +
+  ggtitle("Unique Fragments per donor")+
+  scale_x_discrete("Donor") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90,
+                                   hjust = 1, 
+                                   vjust = 0.5))
+
+```
+Undersequenced samples are from Gng7-Cre. We should re-sequence these.
+
+Next, we'll do some filtering and keep only samples with >20,000 reads (10,000 fragments) and that have > 25% reads overlapping ENCODE data.
+```{r 8 QC Filtering}
+# save the samples for later use
+write.csv(samples, file.path(output_dir, "all_samples.csv"))
+
+# Filter based on at least 20,000 reads (10,000 pairs)
+qc_samples <- samples %>%
+  filter(unique_fragments > 1e4) %>%
+  # Build new source_label column for plotting
+  mutate(source_label = ifelse(!is.na(inj_target),
+                               paste("Retrograde",inj_target),
+                               full_genotype))
+# Post-filtering counts
+source_counts <- table(qc_samples$source_label)
+data.frame(source_label = names(source_counts),
+           n_cells = as.data.frame(source_counts)$Freq)
+
+# Filter based on ENCODE fraction
+qc_samples <- qc_samples %>%
+  filter(ENCODE_frac > 0.25)
+
+# Filter for chromatin content
+qc_samples <- qc_samples %>%
+  filter(frac_gt_250bp > 0.1)
+
+write.csv(samples, "../common/f1e4_e20_c10_samples.csv")
+
+# Post-filtering counts
+source_counts <- table(qc_samples$source_label)
+data.frame(source_label = names(source_counts),
+           n_cells = as.data.frame(source_counts)$Freq)
+
+bam_fragments <- bam_fragments[names(bam_fragments) %in% qc_samples$sample_id]
+
+save(bam_fragments, file = file.path(output_dir, "f1e4_e25_c10_bam_fragments.rda"))
+```
+
+
+Build transcriptional median matrices from VISp scRNA-seq data
+```{r 9 Median Computation}
+if(!file.exists(file.path(output_dir,"median_matrixes.rda"))) {
+  tome <- "//allen/programs/celltypes/workgroups/rnaseqanalysis/shiny/tomes/facs/mouse_V1_ALM_20180520/transcrip.tome"
+  
+  # Load annotations
+  anno <- read_tome_anno(tome)
+  
+  anno <- anno %>%
+    # Remove outlier clusters
+    filter(cluster_id %in% 1:133) %>%
+    # Filter ALM-only clusters
+    group_by(cluster_id) %>%
+    mutate(alm_frac = sum(region_label == "ALM")/n()) %>%
+    ungroup() %>%
+    filter(alm_frac < 0.9) %>%
+    # Only keep VISp cells
+    filter(region_label == "VISp")
+  
+  # Load count data
+  counts <- read_tome_dgCMatrix(tome, "/data/exon")
+  counts <- t(counts)
+  all_samples <- read_tome_sample_names(tome)
+  all_genes <- read_tome_gene_names(tome)
+  colnames(counts) <- all_samples
+  rownames(counts) <- all_genes
+  counts <- counts[,anno$sample_name]
+  
+  # subclass medians
+  subclass_labels <- unique(anno$subclass_label)
+  
+  subclass_med <- map(subclass_labels, 
+                   function(x) {
+                     samples <- anno$sample_name[anno$subclass_label == x]
+                     if(length(samples) > 1) {
+                       subclass_counts <- as.matrix(counts[ ,samples])
+                       rowMedians(subclass_counts)
+                     } else {
+                       counts[, samples]
+                     }
+                   })
+  subclass_med_mat <- do.call("cbind",subclass_med)
+  colnames(subclass_med_mat) <- subclass_labels
+  rownames(subclass_med_mat) <- all_genes
+  
+  # cluster medians
+  cluster_labels <- unique(anno$cluster_label)
+  
+  cluster_med <- map(cluster_labels, 
+                     function(x) {
+                       samples <- anno$sample_name[anno$cluster_label == x]
+                       if(length(samples) > 1) {
+                         cluster_counts <- as.matrix(counts[ ,samples])
+                         rowMedians(cluster_counts)
+                       } else {
+                         counts[, samples]
+                       }
+                     })
+  cluster_med_mat <- do.call("cbind",cluster_med)
+  colnames(cluster_med_mat) <- cluster_labels
+  rownames(cluster_med_mat) <- all_genes
+  
+  save(subclass_med_mat, cluster_med_mat, file = file.path(output_dir, "median_matrixes.rda"))
+}
+```
+
+Select marker genes using scrattch.hicat
+```{r 10 Select Markers}
+tome <- "//allen/programs/celltypes/workgroups/rnaseqanalysis/shiny/tomes/facs/mouse_V1_ALM_20180520/transcrip.tome"
+  
+# Load annotations
+anno <- read_tome_anno(tome)
+
+anno <- anno %>%
+  # Remove outlier clusters
+  filter(cluster_id %in% 1:133) %>%
+  # Filter ALM-only clusters
+  group_by(cluster_id) %>%
+  mutate(alm_frac = sum(region_label == "ALM")/n()) %>%
+  ungroup() %>%
+  filter(alm_frac < 0.9) #%>%
+  # Only keep VISp cells
+  #filter(region_label == "VISp")
+
+# load count data
+counts <- read_tome_dgCMatrix(tome, "/data/exon")
+counts <- t(counts)
+all_samples <- read_tome_sample_names(tome)
+all_genes <- read_tome_gene_names(tome)
+colnames(counts) <- all_samples
+rownames(counts) <- all_genes
+counts <- counts[,anno$sample_name]
+
+# transform to log2(counts + 1) as "normalized" data
+norm_counts <- log2(counts + 1)
+
+# set up cluster factors
+cl <- as.factor(anno$cluster_id)
+names(cl) <- anno$sample_name
+
+# score all cluster pairs for DE Genes with limma
+pairwise_de_scores <- de_score(norm_counts, cl)
+save(pairwise_de_scores, file = "../common/pairwise_visp_cluster_id_de_scores.rda")
+
+# select markers based on pairwise scores
+selected_markers <- select_markers(norm_counts, 
+                                   cl, 
+                                   n.markers = 50, 
+                                   de.genes = pairwise_de_scores)$markers
+
+# keep markers that are also in matrices
+load("../common/median_matrixes.rda")
+
+selected_markers <- intersect(selected_markers, rownames(subclass_med_mat))
+
+save(selected_markers, file = "../common/selected_visp_markers.rda")
+
+```
+
+Retrieve TSS regions, Gene body regions, and GREAT regions from UCSC
+```{r 11 TSS regions}
+
+if(!file.exists(file.path(output_dir,"tss_regions.rda"))) {
+  tss_regions <- get_tss_regions(expand = 2e4,
+                                 genome = "mm10") %>%
+    filter(!grepl("_",chr)) %>%
+    group_by(name) %>%
+    filter(row_number() == 1) %>%
+    ungroup()
+  
+  save(tss_regions, file = file.path(output_dir,"tss_regions.rda"))
+}
+
+```
+
