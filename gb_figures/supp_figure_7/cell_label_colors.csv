@@ -1,0 +1,13 @@
+cell_label_id,cell_label,cell_label_color
+1,Inhibitory neurons,#A9661F
+2,SOM+ Interneurons,#B79B13
+3,Ex. neurons CPN,#9EFF48
+4,Ex. neurons CThPN,#5BE0FF
+5,Ex. neurons SCPN,#00843F
+6,Astrocytes,#62993C
+7,Oligodendrocytes,#5BA984
+8,Microglia,#5572B8
+9,Endothelial II cells,#90478B
+10,Unknown,#C4514E
+11,Collisions,#000000
+12,Graybuck,#808080

@@ -1,0 +1,256 @@
+---
+title: "AWS scATAC-seq Jaccard Clustering"
+output: html_notebook
+---
+
+This notebook is intended to be launched using my launch template called "bioconductor-3.6-20180627". 
+
+Data are stored in snapshot snap-0d06d83c5af8f8eab
+
+m5.12xlarge = 48-core x 192 GB
+m5.24xlarge = 96-core x 384 GB
+
+subnet: us-east-1a
+
+This uses the public AMI from BioConductor with AMI ID ami-ac5df1d3
+The image requires at least 4 cores and 16GB (t2.xlarge)
+Need to add Port 80 at the Security Group step to use Rstudio server.
+
+This needs to be run in the console of the AWS image to get the EBS volume set up and mounted. The sudo password for the pre-built user ubuntu is "bioc"
+
+To ssh, use 
+ssh -i Dropbox/AWS/aibs-scatac-key.pem ubuntu@ --DNS--
+```
+sudo mkdir /scatac_data
+sudo mount /dev/xvdf /scatac_data
+
+sudo mount /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol05aa57a4865858c4c /scatac_data
+```
+
+Set Twilio environment tokens
+```{r}
+Sys.setenv(TWILIO_SID = "ACbf445eae1bb3300a62bb5526e17eb617")
+Sys.setenv(TWILIO_TOKEN = "c2cb0c9ef01e23a4ea95b1a184ff383a")
+library(twilio)
+twilio_num <- 3608586689
+target_num <- 3605205659
+```
+
+Load packages for analysis:
+```{r Load Libraries}
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(GenomicAlignments))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(lowcat))
+suppressPackageStartupMessages(library(Matrix))
+suppressPackageStartupMessages(library(purrr))
+suppressPackageStartupMessages(library(Rphenograph))
+suppressPackageStartupMessages(library(Rtsne))
+
+options(stringsAsFactors = FALSE)
+```
+
+For this analysis, I'll use the following parameters:
+```{r Set Parameters}
+# Random seed
+random_seed <- 2018
+
+# Parallel settings
+n_cores <- 36
+cluster_type <- "PSOCK"
+
+# Sample QC Filtering
+fragment_filter <- 1e4
+encode_filter <- 0.25
+gt_250bp_filter <- 0.1
+
+# Downsampling and overlap settings
+downsample_n <- 1e4
+fragment_extension <- 1e3
+fragment_reduce <- TRUE
+
+# File locations
+gb_data_dir <- "//allen/programs/celltypes/workgroups/mct-t200/T502/scatac_analysis/doc/paper/2018-07-10_paper_analysis/"
+cu_data_dir <- "//allen/programs/celltypes/workgroups/mct-t200/T502/scatac_analysis/doc/paper/2019-01-11_GSE111586_analysis/"
+out_dir <- "//allen/programs/celltypes/workgroups/mct-t200/T502/scatac_analysis/doc/paper/2019-01-11_Graybuck_and_GSE111586/"
+common_dir <- "//allen/programs/celltypes/workgroups/mct-t200/T502/scatac_analysis/doc/paper/common/"
+
+gb_samples_csv <- file.path(common_dir,"f1e4_e25_c10_samples.csv")
+gb_fragment_rda <- file.path(gb_data_dir,"f1e4_e25_c10_bam_fragments.rda")
+
+cu_samples_csv <- file.path(cu_data_dir,"f1e4_e25_c10_samples.csv")
+cu_fragment_rda <- file.path(cu_data_dir,"f1e4_e25_c10_bam_fragments.rda")
+
+medians_rda <- file.path(common_dir,"median_matrixes.rda")
+tss_rda <- file.path(common_dir, "tss_regions.rda")
+
+# Output settings
+jaccard_prefix <- "f1e4_e25_c10_ds1e4_x1e3"
+```
+
+Read files for analysis:
+```{r Read Files}
+gb_samples <- read.csv(gb_samples_csv)
+cu_samples <- read.csv(cu_samples_csv)
+
+common_cols <- intersect(names(gb_samples), names(cu_samples))
+
+samples <- rbind(gb_samples[,common_cols], cu_samples[,common_cols])
+
+load(cu_fragment_rda)
+cu_fragments <- bam_fragments
+load(gb_fragment_rda)
+bam_fragments <- c(bam_fragments, cu_fragments)
+rm(cu_fragments)
+
+```
+
+Filter samples based on QC Criteria parameters
+```{r Filter Samples}
+samples <- samples %>%
+  filter(unique_fragments > fragment_filter) %>%
+  filter(ENCODE_frac > encode_filter) %>%
+  filter(frac_gt_250bp > gt_250bp_filter)
+
+bam_fragments <- bam_fragments[samples$sample_id]
+bam_fragments <- bam_fragments[!is.na(names(bam_fragments))]
+```
+
+Downsample and resize fragments
+```{r Downsample and Resize}
+bam_downsampled <- downsample_fragments(bam_fragments,
+                                        downsample_n = downsample_n,
+                                        discard_if_too_few = TRUE)
+
+bam_expanded <- expand_fragments(bam_downsampled,
+                                 width = fragment_extension,
+                                 collapse = fragment_reduce)
+```
+
+Perform Jaccard distance calculations
+```{r Jaccard Distances}
+jaccard_results <- run_fragment_overlap_jaccard_parallel(bam_expanded,
+                                                         n_cores = n_cores,
+                                                         cluster_type = cluster_type)
+```
+
+```{r PCA}
+jaccard_matrix <- res_to_distance_matrix(jaccard_results)
+
+jaccard_pca <- prcomp(jaccard_matrix)
+
+jaccard_pcs <- jaccard_pca$rotation[,1:30]
+rownames(jaccard_pcs) <- names(bam_expanded)
+
+depth_cor <- map_dbl(1:20,
+                 function(x) {
+                   pc_vals <- jaccard_pcs[,x]
+                   names(pc_vals) <- rownames(jaccard_pcs)
+                   depth_vals <- samples$unique_fragments[match(rownames(jaccard_pcs), samples$sample_id)]
+                   names(depth_vals) <- rownames(jaccard_pcs)
+                   pc_vals <- pc_vals[names(depth_vals)]
+                   cor(pc_vals, depth_vals)
+                 })
+
+sum(abs(depth_cor) > 0.3)
+
+encode_cor <- map_dbl(1:20,
+                 function(x) {
+                   pc_vals <- jaccard_pcs[,x]
+                   names(pc_vals) <- rownames(jaccard_pcs)
+                   encode_vals <- samples$ENCODE_frac[match(rownames(jaccard_pcs), samples$sample_id)]
+                   names(encode_vals) <- rownames(jaccard_pcs)
+                   pc_vals <- pc_vals[names(encode_vals)]
+                   cor(pc_vals, encode_vals)
+                 })d
+
+sum(abs(encode_cor) > 0.3)
+
+size_cor <- map_dbl(1:20,
+                 function(x) {
+                   pc_vals <- jaccard_pcs[,x]
+                   names(pc_vals) <- rownames(jaccard_pcs)
+                   size_vals <- samples$frac_gt_250bp[match(rownames(jaccard_pcs), samples$sample_id)]
+                   names(size_vals) <- rownames(jaccard_pcs)
+                   pc_vals <- pc_vals[names(size_vals)]
+                   cor(pc_vals, size_vals)
+                 })
+
+sum(abs(size_cor) > 0.3)
+
+platform_cor <- map_dbl(1:20,
+                        function(x) {
+                          pc_vals <- jaccard_pcs[,x]
+                          names(pc_vals) <- rownames(jaccard_pcs)
+                          sample_platform <- as.numeric(grepl("sample_",samples$sample_id))
+                          platform_vals <- sample_platform[match(rownames(jaccard_pcs), samples$sample_id)]
+                          names(platform_vals) <- rownames(jaccard_pcs)
+                          pc_vals <- pc_vals[names(platform_vals)]
+                          cor(pc_vals, platform_vals)
+                        })
+
+sum(abs(platform_cor) > 0.2)
+
+
+keep_pcs <- abs(depth_cor) < 0.3 & abs(encode_cor) < 0.3 & abs(size_cor) < 0.3
+
+jaccard_pcs <- jaccard_pcs[, keep_pcs]
+```
+
+
+Convert to a distance matrix and perform tSNE
+```{r tSNE}
+
+set.seed(random_seed)
+
+tsne_results <- Rtsne(jaccard_pcs,
+                      is_distance = FALSE,
+                      pca = FALSE,
+                      perplexity = 10,
+                      num_threads = n_cores)
+rownames(tsne_results$Y) <- rownames(jaccard_pcs)
+
+tsne_df <- data.frame(sample_id = rownames(jaccard_pcs),
+                      x = tsne_results$Y[,1],
+                      y = tsne_results$Y[,2])
+
+```
+
+```{r tSNE plot}
+
+tsne_plot_df <- samples %>%
+  left_join(tsne_df)
+
+
+ggplot() +
+  geom_point(data = tsne_plot_df,
+             aes(x = x,
+                 y = y,
+                 color = log10(unique_fragments)))
+
+ggplot() +
+  geom_point(data = tsne_plot_df,
+             aes(x = x,
+                 y = y,
+                 color = as.factor(grepl("sample_",tsne_plot_df$sample_id))))
+```
+
+
+Save the output
+```{r}
+samples <- left_join(samples, tsne_df)
+
+out_file <- file.path(out_dir,paste0(jaccard_prefix,"_jaccard.rda"))
+save(jaccard_results, jaccard_matrix, tsne_df, samples, file = out_file)
+```
+
+
+Text yourself that it's done
+```{r}
+tw_message <- paste(jaccard_prefix, "completed at",Sys.time())
+tw_send_message(as.character(target_num), 
+                as.character(twilio_num),
+                tw_message)
+```

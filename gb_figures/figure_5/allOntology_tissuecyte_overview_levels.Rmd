@@ -1,0 +1,302 @@
+---
+title: "TissueCyte stats"
+output: html_notebook
+---
+
+mscRE400225:
+
+```{r}
+library(fs)
+library(here)
+setwd(here::here("src"))
+getwd()
+library(jsonlite)
+library(metacoder)
+library(tidyverse)
+options(stringsAsFactors = F)
+
+# raw_ontology <- fromJSON("ccf_ontology.json")[["msg"]]
+# 
+# flatten_ontology <- function(l, ontology_df = NULL) {
+#   
+#   if (is.null(ontology_df)) {
+#     ontology_df <- data.frame(l[names(l) != "children"])[0,]
+#     ontology_df$n_children <- numeric()
+#   }
+#   
+#   if ("children" %in% names(l)) {
+#     
+#     child_df <- data.frame(l[names(l) != "children"])
+#     
+#     n_children_of_children <- map_dbl(l$children,
+#                                   function(x) {
+#                                     if ("children" %in% names(x)) {
+#                                       length(x$children)
+#                                     } else {
+#                                       0
+#                                     }
+#                                   })
+#     
+#     child_df$n_children <- n_children_of_children
+#     
+#     ontology_df <- rbind(ontology_df, child_df)
+# 
+#     for (i in 1:length(l$children)) {
+#       
+#       child_list <- l$children[[i]]
+#       
+#       ontology_df <- flatten_ontology(child_list, ontology_df)
+#     }
+#   }
+#   
+#   return(ontology_df)
+# }
+# 
+# flat_ontology <- flatten_ontology(raw_ontology)
+# 
+# #write.csv(flat_ontology,"flat_ontology.csv", row.names = F)
+# 
+# leaves <- flat_ontology %>%
+#   filter(n_children == 0) %>%
+#   arrange(acronym)
+
+#write.csv(leaves,"flat_ontology_leaves.csv", row.names = F)
+
+library(metacoder)
+library(taxa)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+library(scrattch.vis)
+options(stringsAsFactors = F)
+
+
+flat_ontology <- read.csv("//allen/programs/celltypes/workgroups/mct-t200/Microscopy/mscRE/TissueCyte/Adriana/flat_ontology_with_overview_levels-Edit.csv")
+
+
+#flat_ontology <- read.csv("flat_ontology.csv")
+#flat_ontology$parent_structure_id[1] <- 0
+
+# Full ontology
+flat_ontology <- flat_ontology %>%
+  arrange(st_level) 
+
+# Generate taxons
+taxons <- list("997" = "0")
+
+for (i in 2:nrow(flat_ontology)) {
+  id <- as.character(flat_ontology$id[i])
+  parent_id <- as.character(flat_ontology$parent_structure_id[i])
+  
+  taxons[id] <- paste0(taxons[parent_id], ";", id)
+}
+
+flat_ontology$taxons <- unlist(taxons)
+
+taxonomy <- parse_tax_data(flat_ontology, class_cols = ncol(flat_ontology))
+
+
+                                          
+
+## CTX is id 688
+all_ontology <- flat_ontology %>%
+  #filter(grepl(";688",taxons)) %>%
+  #Remove layers at st_level == 11
+  filter(broad2_keep == TRUE) %>%
+  #filter(st_level < 11) %>%
+  # 0;8;567; are the structures above CTX
+  #mutate(taxons = sub("0;8;567;","",taxons)) %>%
+  mutate(color = paste0("#",color_hex_triplet))
+
+all_taxonomy <- parse_tax_data(all_ontology, class_cols = ncol(flat_ontology))
+
+heat_tree(all_taxonomy,
+          node_label = acronym,
+          #node_color = color,
+          layout = "davidson-harel")
+
+# Get counts for each region
+
+# load structure stats
+mscRE4_400225 <- read.delim(here::here("mscRE4_400225_Adriana","mscRE4_400225_Adriana_VolsandStats.txt"), header = TRUE) %>%
+  `colnames<-`(c("Label.Id","acronym", "Num.Voxels", "Vol.mm3", "Img.mean", "Img.sd"))
+  
+  
+all_ontology <- all_ontology %>%
+  mutate(img_mean = ifelse(acronym %in% mscRE4_400225$acronym,
+                                 mscRE4_400225$Img.mean[match(acronym, mscRE4_400225$acronym)], 0)) 
+
+# getwd()
+# pdf("st_level_cut_allontology.pdf", width = 8, height = 10)
+#  
+# for (x in 0:11) {
+#   print(x)
+#   test <- all_ontology %>%
+#     #filter(img_mean > 0) %>%
+#     filter(st_level == x) %>%
+#     arrange(desc(img_mean))
+#   print(ggplot(test, aes(x = reorder(acronym, img_mean), y = img_mean)) + 
+#           geom_point(colour = "tomato2", size = 0.8) + 
+#           #geom_text(color = "black", size = 1, aes(label = img_mean)) +
+#           labs(title = "Brain regions and mean values per ontology level") +
+#           coord_flip(ylim = c(0,1050)) + 
+#           ggtitle(paste(x, "all ontology")) + 
+#           theme_bw(base_size = 3))
+# }
+# dev.off()
+
+compute_hierarchical <- function(df, 
+                                 fun,
+                                 compute_column,
+                                 result_column,
+                                 include_node = FALSE,
+                                 na.rm = NULL,
+                                 taxon_column = "taxons") {
+  
+  library(stringr)
+  library(dplyr)
+  
+  df[[result_column]] <- 0
+  
+  # Get the depth by counting the semicolons in taxons
+  df$depth <- str_count(df[[taxon_column]], ";")
+  # Sort by deepest first
+  df <- df %>%
+    mutate(original_order = 1:n()) %>%
+    arrange(desc(depth))
+  
+  for (i in 1:nrow(df)) {
+    
+    if (df$n_children[i] == 0) {
+      # Otherwise, use the row for the leaf
+      df[[result_column]][i] <- df[[compute_column]][i]
+    } else {
+      # If this node has children, find them using the parent_structure_id column
+      children <- which(df$parent_structure_id == df$id[i])
+      
+      # Get the values for the specified compute_column for the children
+      children_values <- df[[result_column]][children]
+      
+      if(include_node) {
+        children_values <- c(df[[compute_column]][i], children_values)
+      }
+      
+      # Run the function on the children_values
+      if(is.null(na.rm)) {
+        df[[result_column]][i] <- do.call(fun, list(children_values))
+      } else {
+        df[[result_column]][i] <- do.call(fun, list(children_values, na.rm = na.rm))
+      }
+    }
+
+  }
+  
+  # rearrange results to match original order
+  df <- df %>%
+    arrange(original_order) %>%
+    select(-original_order, -depth)
+  
+  # rearrange columns so that taxons is last (required for parse_tax_data)
+  nontax <- names(df)[names(df) != taxon_column]
+  df <- df[, c(nontax, taxon_column)]
+  
+  df
+}
+
+
+
+calcs = c("min", "max", "mean", "median")
+
+for (calc in calcs) {
+  
+  all_hier <- all_ontology %>%
+  compute_hierarchical(fun = calc, 
+                       compute_column = "img_mean", 
+                       result_column = "pop_children", 
+                       include_node = TRUE, 
+                       taxon_column = "taxons")
+
+print(names(all_hier))
+  
+all_ontology2 <- left_join(all_ontology, all_hier)
+
+print(names(all_ontology2))
+
+all_taxonomy <- parse_tax_data(all_ontology2, class_cols = ncol(flat_ontology))
+
+
+setwd(here("mscRE4_400225_Adriana"))
+set.seed(42)
+
+pdf(paste0("allontology_coverage_heattree_",calc, "_broad2_keep.pdf"))
+
+print(heat_tree(all_taxonomy,
+          node_label = acronym,
+          node_color =  pop_children,
+          title = paste0(calc,"_children, scrattch.vis colors, davidson-harel, all ontology, broad2_keep"),
+          node_label_color = "#000000",
+          node_color_range = c("darkblue","dodgerblue","gray80","orange","orangered"),
+          node_size = img_mean,
+          node_label_size = 1,
+          layout = "davidson-harel"))
+
+print(heat_tree(all_taxonomy,
+          node_label = acronym,
+          node_color = pop_children ,
+          title = paste0(calc,"_children, davidson-harel, all ontology, broad2_keep"),
+          node_label_color = "#000000",
+          node_color_range = c("#a8e6cf","#dcedc1","#ffd3b6","#ffaaa5","#ee6872","#ec1c2c"),
+          node_size = img_mean,
+          node_label_size = 1,
+          layout = "davidson-harel"))
+
+print(heat_tree(all_taxonomy,
+          node_label = acronym,
+          node_color =  pop_children,
+          title = paste0(calc,"_children, davidson-harel, all ontology, broad2_keep"),
+          node_label_color = "#000000",
+          node_color_range = c("#a8e6cf","#dcedc1","#ffd3b6","#ffaaa5","#ee6872","#ec1c2c"),
+          node_size = img_mean,
+          node_label_size = 1,
+          layout = "kamada-kawai"))
+
+dev.off()
+}
+
+
+```
+```{r}
+pdf("allontology_coverage_heattree_raw_broad2_keep_mscRE400225.pdf", width = 8, height = 9)
+
+print(heat_tree(all_taxonomy,
+          node_label = acronym,
+          node_color =  img_mean,
+          title = "Raw (not populated) scrattch.vis colors, davidson-harel, all ontology, broad2_keep",
+          node_label_color = "#000000",
+          node_color_range = c("darkblue","dodgerblue","gray80","orange","orangered"),
+          node_size = img_mean,
+          node_label_size = 1,
+          layout = "davidson-harel"))
+
+print(heat_tree(all_taxonomy,
+          node_label = acronym,
+          node_color = img_mean,
+          title = "Raw (not populated)  davidson-harel, all ontology, broad2_keep",
+          node_label_color = "#000000",
+          node_color_range = c("#a8e6cf","#dcedc1","#ffd3b6","#ffaaa5","#ee6872","#ec1c2c"),
+          node_size = img_mean,
+          node_label_size = 1,
+          layout = "davidson-harel"))
+
+print(heat_tree(all_taxonomy,
+          node_label = acronym,
+          node_color =  img_mean,
+          title = "Raw (not populated) davidson-harel, all ontology, broad2_keep",
+          node_label_color = "#000000",
+          node_color_range = c("#a8e6cf","#dcedc1","#ffd3b6","#ffaaa5","#ee6872","#ec1c2c"),
+          node_size = img_mean,
+          node_label_size = 1,
+          layout = "kamada-kawai"))
+
+dev.off()
+```

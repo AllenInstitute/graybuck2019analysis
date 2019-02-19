@@ -1,0 +1,85 @@
+---
+title: "RNA-seq objects for Centroid Classifier analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+Here, I'll load and inspect the RNA-seq objects that are required for using the `scrattch.hicat` centroid classifier functions.
+
+```{r}
+# Zizhen's process directory
+pdir <- "//allen/programs/celltypes/workgroups/rnaseqanalysis/yzizhen/SmartSeq_cells/V1_ALM/process_24411/"
+```
+
+
+cl.clean.rda contains a named factor factor object, cl.clean, with cluster ids as values, and sample ids as names
+```{r}
+load(file.path(pdir,"cl.final.rda"))
+str(cl)
+```
+
+cl.df.rda contains a data.frame, cl.df, with cluster annotations.
+```{r}
+cl.df$cluster_id <- 1:nrow(cl.df)
+str(cl.df)
+```
+
+Importantly, the `rownames()` of cl.df match the values in the cl.clean factor object, and are used for selection of rows by Zizhen's scripts.
+```{r}
+rownames(cl.df)
+```
+
+Build annotations
+```{r}
+library(scrattch)
+library(scrattch.io)
+library(dplyr)
+
+tome <- "//allen/programs/celltypes/workgroups/rnaseqanalysis/shiny/tomes/facs/mouse_V1_ALM_20180520/transcrip.tome"
+anno <- read_tome_anno(tome, c("^cluster","subclass")) %>%
+  filter(cluster_id %in% 1:133)
+
+```
+
+
+norm.dat.rda contains norm.dat, a dgCMatrix of log2-transformed cpm values for every sample and gene. I think this could also be substituted with a full, base R matrix object, and the functions should still run.
+```{r}
+counts <- t(read_tome_dgCMatrix(tome, "/data/exon"))
+rownames(counts) <- read_tome_gene_names(tome)
+colnames(counts) <- read_tome_sample_names(tome)
+
+counts <- counts[,anno$sample_name]
+```
+
+generate cluster and subclass medians
+```{r}
+library(scrattch.hicat)
+
+cluster_cl <- as.factor(anno$cluster_id)
+names(cluster_cl) <- anno$sample_name
+cl.med <- get_cl_medians(counts, cluster_cl)
+
+subclass_cl <- as.factor(anno$subclass_id)
+names(subclass_cl) <- anno$sample_name
+
+sub.med <- get_cl_medians(counts, subclass_cl)
+
+
+```
+
+get marker genes
+```{r}
+load(file.path(pdir, "select.markers.rda"))
+```
+
+Save objects
+```{r}
+save(cl.med, file = "cl.med.rda")
+save(sub.med, file = "sub.med.rda")
+save(anno, file = "anno.rda")
+save(select.markers, file = "select.markers.rda")
+
+```
+
+

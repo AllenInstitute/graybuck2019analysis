@@ -1,0 +1,113 @@
+---
+title: "TissueCyte Analysis"
+output: html_notebook
+---
+
+Load packages
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(metacoder)
+library(taxa)
+options(stringsAsFactors = FALSE)
+```
+
+Directories
+```{r}
+tc_dir <- "//allen/programs/celltypes/workgroups/mct-t200/Microscopy/mscRE/TissueCyte"
+res_dir <- "//allen/programs/celltypes/workgroups/mct-t200/Microscopy/mscRE/TissueCyte/Lucas/400225_Retroorbital_TissueCyte_mscRE4-FlpO"
+adri_colors <- c("#a8e6cf","#dcedc1","#ffd3b6","#ffaaa5","#ee6872","#ec1c2c")
+```
+
+Load files
+```{r}
+source(file.path(tc_dir, "ontology_functions.R"))
+flat_ontology <- read.csv(file.path(tc_dir, "flat_ontology_with_overview_levels.csv"))
+ish_energy <- read.csv(file.path(tc_dir, "ish_energy_per_structure.csv"))
+tc_results <- read.delim(file.path(res_dir, "mscRE4_400225_Adriana_VolsandStats.txt"))
+names(tc_results) <- c("tcid","acronym","voxels","volume","mean_red","stdev_red")
+```
+
+Generate taxons
+```{r}
+flat_ontology <- generate_taxons(flat_ontology, value_column = "acronym", taxon_column = "acronym_taxons")
+flat_ontology <- generate_taxons(flat_ontology)
+```
+
+Join and aggregate
+```{r}
+data <- flat_ontology %>%
+  left_join(tc_results)
+data$mean_red[is.na(data$mean_red)] <- 0
+
+max_data <- compute_hierarchical(data,
+                                  "max",
+                                  "mean_red",
+                                  "str_max",
+                                  include_node = FALSE,
+                                  na.rm = TRUE)
+
+filtered_max_data <- max_data %>%
+  mutate(str_size = str_max - min(str_max)) %>%
+  last_column_shift("taxons") %>%
+  filter(broad2_keep) %>%
+  cleanup_taxons
+```
+
+Plot
+```{r}
+filtered_max_taxonomy <- parse_tax_data(filtered_max_data, class_cols = ncol(filtered_max_data))
+
+set.seed(100)
+heat_tree(filtered_max_taxonomy,
+          node_label = acronym,
+          node_color =  str_max,
+          node_label_color = "#000000",
+          node_color_range = adri_colors,
+          node_size = str_size,
+          node_label_size = 1,
+          layout = "davidson-harel")
+
+```
+
+Correlation with ISH data
+```{r}
+ish_str <- names(ish_energy)[-1]
+
+common_str <- intersect(ish_str, flat_ontology$acronym)
+
+ish_data <- as.matrix(ish_energy[, common_str])
+rownames(ish_data) <- ish_energy$gene
+
+tc_values <- mean_data$mean_red[match(common_str, mean_data$acronym)]
+
+correlations <- apply(ish_data, 1, function(x) {
+  cor(x, tc_values, method = "spearman")
+})
+
+correlations[order(correlations, decreasing = TRUE)][1:10]
+
+```
+
+Correlation with ISH data - Isocortex only
+```{r}
+iso_ontology <- flat_ontology %>%
+  filter(grepl("Isocortex", acronym_taxons))
+
+ish_str <- names(ish_energy)[-1]
+
+common_str <- intersect(ish_str, iso_ontology$acronym)
+
+ish_data <- as.matrix(ish_energy[, common_str])
+rownames(ish_data) <- ish_energy$gene
+
+tc_values <- mean_data$mean_red[match(common_str, mean_data$acronym)]
+
+correlations <- apply(ish_data, 1, function(x) {
+  cor(x, tc_values, method = "spearman")
+})
+
+correlations[order(correlations, decreasing = TRUE)][1:100]
+
+```
+
+Looks to me like ISH data may not be segmented well enough for this. Things like Vgf that are pan-neuronal are highly correlated because L5 cells are large.

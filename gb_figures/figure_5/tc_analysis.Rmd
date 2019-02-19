@@ -1,0 +1,168 @@
+---
+title: "TissueCyte Analysis"
+output: html_notebook
+---
+
+Load packages
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(metacoder)
+library(taxa)
+library(ggplot2)
+library(cocoframer)
+library(scrattch.vis)
+options(stringsAsFactors = FALSE)
+```
+
+Directories
+```{r}
+tc_dir <- "//allen/programs/celltypes/workgroups/mct-t200/Microscopy/mscRE/TissueCyte"
+res_dir <- "//allen/programs/celltypes/workgroups/mct-t200/Microscopy/mscRE/TissueCyte/Lucas/400225_Retroorbital_TissueCyte_mscRE4-FlpO/"
+adri_colors <- c("#a8e6cf","#dcedc1","#ffd3b6","#ffaaa5","#ee6872","#ec1c2c")
+```
+
+Load files
+```{r}
+source(file.path(tc_dir, "ontology_functions.R"))
+flat_ontology <- read.csv(file.path(tc_dir, "flat_ontology_with_overview_levels.csv"))
+
+structure_position_array <- get_ccf_annotation()
+flat_position_data <- reshape2::melt(structure_position_array) 
+names(flat_position_data) <- c("ap","si","lr","id")
+
+structure_ap_mean <- flat_position_data %>%
+  group_by(id) %>%
+  summarise(ap = mean(ap, na.rm = TRUE),
+            si = mean(si, na.rm = TRUE))
+
+flat_ontology <- left_join(flat_ontology, structure_ap_mean)
+
+tc_results <- read.csv(file.path(res_dir, "background_subtracted_summary.csv"), header = TRUE)
+
+tc_results <- tc_results %>%
+  mutate(acronym = sub("2-3","2/3",acronym)) %>%
+  select(-id)
+```
+
+Generate taxons
+```{r}
+flat_ontology <- generate_taxons(flat_ontology, value_column = "acronym", taxon_column = "acronym_taxons")
+flat_ontology <- generate_taxons(flat_ontology)
+```
+
+Join and aggregate
+```{r}
+data <- flat_ontology %>%
+  left_join(tc_results)
+data$energy[is.na(data$energy)] <- 0
+
+max_data <- compute_hierarchical(data,
+                                  "max",
+                                  "energy",
+                                  "str_max",
+                                  include_node = FALSE,
+                                  na.rm = TRUE)
+
+filtered_max_data <- max_data  %>%
+  mutate(log_str_max = log10(str_max + 1)) %>%
+  last_column_shift("taxons") %>%
+  filter(broad2_keep) %>%
+  cleanup_taxons
+```
+
+Plot
+```{r}
+filtered_max_taxonomy <- parse_tax_data(filtered_max_data, class_cols = ncol(filtered_max_data))
+
+set.seed(2018)
+tree_plot <- heat_tree(filtered_max_taxonomy,
+          node_label = acronym,
+          node_color =  log_str_max,
+          node_label_color = "#000000",
+          node_color_range = adri_colors,
+          node_size = log_str_max,
+          node_label_size = 1,
+          layout = "davidson-harel")
+
+ggsave(file.path(res_dir,"tree_plot.pdf"),
+       tree_plot,
+       width = 8, height = 4,
+       useDingbats = FALSE
+       )
+
+```
+
+```{r}
+median_data <- compute_hierarchical(data,
+                                  "median",
+                                  "energy",
+                                  "str_median",
+                                  include_node = FALSE,
+                                  na.rm = TRUE)
+
+filtered_median_data <- median_data %>%
+  last_column_shift("taxons") %>%
+  filter(broad2_keep) %>%
+  cleanup_taxons
+```
+
+Plot
+```{r}
+filtered_median_taxonomy <- parse_tax_data(filtered_median_data, class_cols = ncol(filtered_median_data))
+
+set.seed(2018)
+heat_tree(filtered_median_taxonomy,
+          node_label = acronym,
+          node_color =  str_median,
+          node_label_color = "#000000",
+          node_color_range = adri_colors,
+          node_size = str_median,
+          node_label_size = 1,
+          layout = "davidson-harel")
+
+```
+
+
+Let's try some layer heatmaps
+```{r}
+layer_ypos <- data.frame(layer = c("1","2/3","4","5","6a","6b"),
+                         y = 1:6)
+
+layered_str <- data %>%
+  filter(grepl("Isocortex",acronym_taxons)) %>%
+  filter(grepl("[0-9/]+[ab]?$", acronym)) %>%
+  #filter(energy != 0) %>%
+  mutate(layer = sub(".+ ","", name)) %>%
+  mutate(structure = sub("[0-9/ab]+$","",acronym)) %>%
+  left_join(layer_ypos)
+
+str_order <- layered_str %>%
+  group_by(structure) %>%
+  summarise(min_ap = min(ap, na.rm = TRUE)) %>%
+  filter(!is.infinite(min_ap)) %>%
+  arrange(min_ap) %>%
+  mutate(x = 1:n())
+
+layered_str <- layered_str %>%
+  left_join(str_order) %>%
+  filter(!is.na(x)) %>%
+  mutate(fill = values_to_colors(log10(energy + 1), colorset = adri_colors))
+  
+layer_plot <- ggplot() +
+  geom_tile(data = layered_str,
+            aes(x = x,
+                y = y,
+                fill = fill)) +
+  scale_fill_identity() +
+  scale_y_reverse("Cortical Layer",breaks = layer_ypos$y, labels = layer_ypos$layer, expand = c(0,0)) +
+  scale_x_continuous("Cortical Region",breaks = str_order$x, labels = str_order$structure, expand = c(0,0)) +
+  theme_classic(5) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.3))
+
+ggsave(file.path(res_dir,"layer_plot.pdf"),
+       layer_plot,
+       width = 3,
+       height = 1.5,
+       useDingbats = F)
+```
+
